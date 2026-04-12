@@ -1,6 +1,6 @@
 # @inproceedings{HM-TDF,  
-#   title={Hard Sample Mining-Based Tongue Diagnosis Framework for Fatty Liver Disease Severity Classification Using Kolmogorov-Arnold Network},  
-#   link={https://github.com/MLDMXM2017/HM-TDF}  
+#   title:{Hard Sample Mining-Based Tongue Diagnosis Framework for Fatty Liver Disease Severity Classification Using Kolmogorov-Arnold Network},  
+#   link:{https://github.com/MLDMXM2017/HM-TDF}  
 # }  
 
 import numpy as np
@@ -25,26 +25,35 @@ class MffKan(nn.Module):
         super().__init__()
         self.num_features = num_features
         self.kan_linears = nn.ModuleList()
+        self.use_tinyvit = False
 
-        # Image Encoder: ResNet18 (more stable alternative to TinyViT)
+        # Image Encoder: TinyViT (primary option)
         if TIMM_AVAILABLE:
             try:
-                self.IE = timm.create_model('resnet18', pretrained=True, num_classes=0)
-                self.ie_dim = 512  # ResNet18 outputs 512
-            except:
-                # Fallback: use a simple feature extractor
-                print("Warning: Using fallback feature extractor")
-                self.IE = nn.Sequential(
-                    nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                    nn.AdaptiveAvgPool2d((1, 1)),
-                    nn.Flatten()
-                )
-                self.ie_dim = 64
+                self.IE = timm.create_model('tiny_vit_5m_224', pretrained=True, num_classes=0)
+                self.ie_dim = 768  # TinyViT outputs 768
+                self.use_tinyvit = True
+                print("[INFO] Using TinyViT as Image Encoder (768-dim output)")
+            except Exception as e:
+                print(f"Warning: TinyViT loading failed ({str(e)}). Using ResNet18 fallback.")
+                try:
+                    self.IE = timm.create_model('resnet18', pretrained=True, num_classes=0)
+                    self.ie_dim = 512  # ResNet18 outputs 512
+                    print("[INFO] Using ResNet18 as Image Encoder (512-dim output)")
+                except Exception as e2:
+                    print(f"Warning: ResNet18 loading failed ({str(e2)}). Using simple CNN fallback.")
+                    self.IE = nn.Sequential(
+                        nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
+                        nn.BatchNorm2d(64),
+                        nn.ReLU(inplace=True),
+                        nn.AdaptiveAvgPool2d((1, 1)),
+                        nn.Flatten()
+                    )
+                    self.ie_dim = 64
+                    print("[INFO] Using simple CNN fallback (64-dim output)")
         else:
             # Fallback: use a simple feature extractor
-            print("Warning: timm not available, using fallback feature extractor")
+            print("Warning: timm not available, using simple CNN fallback")
             self.IE = nn.Sequential(
                 nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
                 nn.BatchNorm2d(64),
@@ -53,13 +62,18 @@ class MffKan(nn.Module):
                 nn.Flatten()
             )
             self.ie_dim = 64
+            print("[INFO] Using simple CNN fallback (64-dim output)")
+
+        # Projection layer: Project IE output to 512 dimensions
+        # This ensures compatibility with existing fused feature dimension (512 + 128 = 640)
+        # CRITICAL: main.py expects net.ie_proj to exist
+        self.ie_proj = nn.Linear(self.ie_dim, 512)
 
         # DE output dimension
         self.de_dim = 128  # DE output dimension
         
-        # No projection needed since ResNet18 already outputs 512
-        # Fused dimension: IE output + DE output
-        self.fused_dim = self.ie_dim + self.de_dim  # 512 + 128 = 640
+        # Fused dimension: After projection IE output (512) + DE output (128)
+        self.fused_dim = 512 + self.de_dim  # 512 + 128 = 640
 
         # Indicator Encoder (DE) - UNCHANGED from original
         self.DE = nn.Sequential(KAN_Linear(num_features,        32, # in, out
@@ -104,7 +118,7 @@ class MffKan(nn.Module):
 
     def forward(self, X, f_p, debug=False):
         """
-        Forward pass for MFF-KAN with ResNet18 Image Encoder and CNN Classifier.
+        Forward pass for MFF-KAN with TinyViT Image Encoder and CNN Classifier.
         
         Args:
             X: Image tensor (batch_size, 3, 224, 224)
@@ -114,11 +128,21 @@ class MffKan(nn.Module):
         Returns:
             logits: Classification logits (batch_size, num_labels)
         """
-        # Image Encoder: ResNet18 (outputs 512 features)
-        f_i = self.IE(X)  # (batch_size, 512)
+        # Image Encoder: TinyViT → (batch_size, 768)
+        # ResNet18 → (batch_size, 512), or simple CNN → (batch_size, 64)
+        f_i = self.IE(X)
         
         if debug:
             print(f"[DEBUG] After IE: f_i.shape = {f_i.shape}")
+        
+        # Projection layer: Project IE output to 512 dimensions
+        # TinyViT: (batch_size, 768) → (batch_size, 512)
+        # ResNet18: (batch_size, 512) → (batch_size, 512)
+        # Simple CNN: (batch_size, 64) → (batch_size, 512)
+        f_i = self.ie_proj(f_i)  # (batch_size, 512)
+        
+        if debug:
+            print(f"[DEBUG] After ie_proj: f_i.shape = {f_i.shape}")
         
         # Indicator Encoder: DE (KAN-based, unchanged)
         f_p = self.DE(f_p)  # (batch_size, 128)
@@ -149,7 +173,8 @@ class MffKan(nn.Module):
     
     def unfreeze_ie_layers(self, unfreeze_ratio=0.5):
         """
-        Unfreeze ResNet18 layers for fine-tuning (staged fine-tuning strategy).
+        Unfreeze Image Encoder layers for fine-tuning (staged fine-tuning strategy).
+        Supports TinyViT and ResNet18.
         
         Args:
             unfreeze_ratio: Fraction of total layers to unfreeze from the end (0.0-1.0).
@@ -157,11 +182,11 @@ class MffKan(nn.Module):
                            Default: 0.5 = unfreeze last 50% of layers.
         
         Example:
-            # After N epochs, unfreeze last 50% of ResNet18 layers
+            # After N epochs, unfreeze last 50% of layers
             net.unfreeze_ie_layers(unfreeze_ratio=0.5)
         """
         if not TIMM_AVAILABLE:
-            print("[WARNING] ResNet18 not available, cannot unfreeze layers")
+            print("[WARNING] Image Encoder not available via timm, cannot unfreeze layers")
             return
         
         # Get all named parameters from IE
@@ -173,11 +198,14 @@ class MffKan(nn.Module):
         for i, (name, param) in enumerate(ie_params):
             if i >= (total_layers - unfreeze_count):
                 param.requires_grad = True
-                print(f"[UNFREEZE] Layer {i}/{total_layers}: {name}")
+                if i < total_layers - 1 or unfreeze_count <= 5:  # Print first few for debugging
+                    print(f"[UNFREEZE] Layer {i}/{total_layers}: {name}")
             else:
                 param.requires_grad = False
         
-        print(f"[INFO] Unfroze {unfreeze_count}/{total_layers} ResNet18 layers for fine-tuning")
+        encoder_name = "TinyViT" if self.use_tinyvit else "ResNet18"
+        print(f"[INFO] Unfroze {unfreeze_count}/{total_layers} {encoder_name} layers for fine-tuning")
+
 
 # define net structure
 def get_net(num_features, num_labels, drop_rate):
