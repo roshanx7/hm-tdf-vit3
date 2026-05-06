@@ -117,9 +117,9 @@ def train(net, train_img_name, train_indicator, train_labels,
             for param in net.parameters():
                 if param.requires_grad:
                     opt_parameters.append(param)
-            optimizer = torch.optim.AdamW(opt_parameters, lr=learning_rate * 0.1, weight_decay=weight_decay)
+            optimizer = torch.optim.AdamW(opt_parameters, lr=learning_rate * 0.01, weight_decay=weight_decay)
             scheduler = lr_scheduler.LambdaLR(optimizer, 
-                                            lr_lambda=lambda ep: adjust_learning_rate(ep - epoch, warmup_factor, warmup_epochs))
+                                            lr_lambda=lambda ep: adjust_learning_rate(ep, warmup_factor, warmup_epochs))
             print(f"[INFO] Recreated optimizer with reduced learning rate (0.1x)")
         
         train_ls_batch = []
@@ -129,20 +129,35 @@ def train(net, train_img_name, train_indicator, train_labels,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels.to(device)
             logits = net(X, Xf)
+            
+            # NaN/Inf detection in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print("[ERROR] NaN/Inf detected in logits")
+                break
 
             cls_loss = moi_loss(logits, y)
             reg_loss = net.regularization_loss(reg_loss_rate_active, reg_loss_rate_entropy)
             l = cls_loss + reg_loss
+            
+            # Loss validation
+            if torch.isnan(l) or torch.isinf(l):
+                print("[ERROR] NaN/Inf detected in loss")
+                break
+            
             train_ls_batch.append(l.item())
             (l/mini_batch_num).backward() # Accumulate gradients
             # print(l.item())
             i += 1
             if i >= mini_batch_num:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 i = 0
                 print(l.item(), end="\r")              
         if i:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             optimizer.step()
         scheduler.step() # adjust learning rate
         print('train_loss = ', sum(train_ls_batch)/len(train_ls_batch))
@@ -224,21 +239,36 @@ def train(net, train_img_name, train_indicator, train_labels,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X, Xf, y = img_tensor.to(device), feature_tensor.to(device), labels.to(device)
             logits = net(X, Xf)
+            
+            # NaN/Inf detection in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print("[ERROR] NaN/Inf detected in logits")
+                break
 
             # Use cross-entropy loss for hard mining training
             cls_loss = torch.nn.functional.cross_entropy(logits, y.argmax(dim=1))
             reg_loss = net.regularization_loss(reg_loss_rate_active, reg_loss_rate_entropy)
             l = cls_loss + reg_loss
+            
+            # Loss validation
+            if torch.isnan(l) or torch.isinf(l):
+                print("[ERROR] NaN/Inf detected in loss")
+                break
+            
             train_ls_batch.append(cls_loss.item())
             (l/mini_batch_num).backward() # add grad
             # print(l.item())
             i += 1
             if i >= mini_batch_num:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
                 hard_optimizer.step()
                 hard_optimizer.zero_grad()
                 i = 0
                 print(l.item(), end="\r")              
         if i:
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
             hard_optimizer.step()
         hard_scheduler.step() # adjust learning rate
         train_ls.append(sum(train_ls_batch)/len(train_ls_batch))
@@ -325,6 +355,10 @@ def train(net, train_img_name, train_indicator, train_labels,
         pred_array = np.asarray(yhat_hub)
         pred_exp = np.exp(pred_array - np.max(pred_array, axis=1, keepdims=True))
         pred_softmax = pred_exp / pred_exp.sum(axis=1, keepdims=True)
+        
+        # Sanitize predictions before roc_auc_score
+        pred_softmax = np.nan_to_num(pred_softmax, nan=0.0, posinf=1.0, neginf=0.0)
+        
         if num_labels == 2:
             Auc = roc_auc_score(label_hub, pred_softmax[:, 1])
         else:
@@ -421,12 +455,14 @@ def adjust_learning_rate(epoch, warmup_factor, warmup_epochs):
     min_lr = warmup_factor * max_lr
     if epoch < warmup_epochs:
         # Preheat stage: linearly increase the learning rate
-        return min_lr + (max_lr - min_lr) * epoch / warmup_epochs
+        lr = min_lr + (max_lr - min_lr) * epoch / warmup_epochs
     else:
         # Trionometric function learning rate decay strategy
-        t = epoch - warmup_epochs
-        cycle_length = num_epochs
-        return min_lr + (max_lr - min_lr) * (1 + math.cos(math.pi * t / cycle_length)) / 2
+        t = max(0, epoch - warmup_epochs)  # Ensure non-negative
+        cycle_length = max(1, num_epochs)  # Avoid division by zero
+        lr = min_lr + (max_lr - min_lr) * (1 + math.cos(math.pi * t / cycle_length)) / 2
+    # Clamp to ensure non-negative learning rate
+    return max(0.0, lr)
 
 from models import Mffkan as model # 1
 
