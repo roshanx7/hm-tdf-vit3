@@ -16,23 +16,22 @@ from sklearn.metrics import roc_auc_score, roc_curve, auc
 
 
 
-def data_iter(rand_shuf, img_dir, img_name, features, labels,
+def data_iter(rand_shuf, img_dir, img_name_list, features, labels,
               images_per_gpu, rgb_mean, rgb_std, pad_val,
               image_shape):
     
     if rand_shuf:
-        num_samples = len(img_name)
+        num_samples = len(img_name_list)
         indices = list(range(num_samples))
         random.shuffle(indices)
     else: # For validation
-        num_samples = len(img_name)
+        num_samples = len(img_name_list)
         indices = list(range(num_samples))      
 
     transforms = torchvision.transforms.Compose([
         torchvision.transforms.Resize(image_shape),
         torchvision.transforms.ToTensor(),
         torchvision.transforms.Normalize(mean=rgb_mean, std=rgb_std)])
-
 
     for i in range(0, num_samples, images_per_gpu):
         rotate_index_0 = torch.randint(0, len(rotate_list), (images_per_gpu,1))
@@ -42,17 +41,26 @@ def data_iter(rand_shuf, img_dir, img_name, features, labels,
             batch_indices = indices[i:] + indices[: images_per_gpu - num_samples + i]
         else:
             batch_indices = indices[i: i + images_per_gpu]   
+        
         imgs_hub_0 = []
         imgs_hub_1 = []
         for k in range(images_per_gpu):
             j = batch_indices[k]
-            img_tongue = transforms(img_array[rotate_index_0[k]][img_name[j]])
-            imgs_hub_0.append(img_tongue)
-            img_tongue = transforms(img_array[rotate_index_1[k]][img_name[j]])
-            imgs_hub_1.append(img_tongue)
-        imgs_tensor_0 = torch.stack(imgs_hub_0, dim=0) # !!!!!!!!!!!
+            rotate_dir_0 = rotate_list[rotate_index_0[k].item()]
+            rotate_dir_1 = rotate_list[rotate_index_1[k].item()]
+            img_path_0 = os.path.join(img_dir, rotate_dir_0, img_name_list[j])
+            img_path_1 = os.path.join(img_dir, rotate_dir_1, img_name_list[j])
+            
+            # Load images on-demand
+            img_tongue_0 = transforms(Image.open(img_path_0).convert('RGB'))
+            img_tongue_1 = transforms(Image.open(img_path_1).convert('RGB'))
+            
+            imgs_hub_0.append(img_tongue_0)
+            imgs_hub_1.append(img_tongue_1)
+        
+        imgs_tensor_0 = torch.stack(imgs_hub_0, dim=0)
         imgs_tensor_1 = torch.stack(imgs_hub_1, dim=0)
-        yield imgs_tensor_0, imgs_tensor_1, rotate_index_0 - rotate_index_1 + 0.0 # images, coordinates, features, labels
+        yield imgs_tensor_0, imgs_tensor_1, rotate_index_0 - rotate_index_1 + 0.0
 
 def train(net, train_img_name, train_features, train_labels, 
           valid_img_name, valid_features, valid_labels,
@@ -74,7 +82,7 @@ def train(net, train_img_name, train_features, train_labels,
         net.train()
         optimizer.zero_grad()
         i = 0
-        for imgs_tensor_0, imgs_tensor_1, labels in data_iter(True, img_dir, train_img_name, train_features, train_labels,
+        for imgs_tensor_0, imgs_tensor_1, labels in data_iter(True, img_dir, train_img_name, None, None,
                                                                 images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
             X0, X1, y = imgs_tensor_0.to(device), imgs_tensor_1.to(device), labels.to(device)
             logit = net(X0, 0) - net(X1, 0)
@@ -99,7 +107,7 @@ def train(net, train_img_name, train_features, train_labels,
             samples_num = len(valid_img_name)
             pred_hub = []
             label_hub = []
-            for imgs_tensor_0, imgs_tensor_1, labels in data_iter(False, img_dir, valid_img_name, valid_features, valid_labels,
+            for imgs_tensor_0, imgs_tensor_1, labels in data_iter(False, img_dir, valid_img_name, None, None,
                                                                     images_per_gpu, rgb_mean, rgb_std, pad_val, image_shape): 
                 X0, X1, y = imgs_tensor_0.to(device), imgs_tensor_1.to(device), labels.to(device)
                 logit = net(X0, 0) - net(X1, 0)
@@ -244,9 +252,8 @@ if __name__ == "__main__":
 
     train_data = pd.read_csv(data_path).iloc[:num_images]
     # get images' name
-    rotate_list = os.listdir(img_dir)
+    rotate_list = sorted(os.listdir(img_dir))  # Sort for consistency
     train_img_name = list(train_data.iloc[:,0])
-    train_img_name = [[rotare + '/' + image for image in train_img_name] for rotare in rotate_list]
     # get features
     all_features = train_data.iloc[:, 1:-1]
     numeric_features = all_features.dtypes[all_features.dtypes != 'object'].index
@@ -264,13 +271,8 @@ if __name__ == "__main__":
     num_features = all_features.shape[1]
     num_labels = 1
 
-    img_array = []
-    for train_img_name_sub in train_img_name:
-        img_array_sub = []
-        for img_name in train_img_name_sub:
-            img_array_sub.append(Image.open(img_dir + img_name).convert('RGB'))
-        img_array.append(img_array_sub)
-    train_img_name = list(range(len(train_img_name[0])))
+    # Note: train_img_name already assigned above as list(train_data.iloc[:,0])
+    # Images will be loaded on-demand in data_iter
                     
     mini_batch_num = batch_size/images_per_gpu
     if mini_batch_num!=round(mini_batch_num):
