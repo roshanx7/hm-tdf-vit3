@@ -23,6 +23,61 @@ except ImportError:
     print("Warning: timm not installed. Install with: pip install timm")
 
 
+# =========================
+# MetaFusion-Inspired Gated Fusion Layer
+# =========================
+class FusionLayer(nn.Module):
+    """Metadata-guided residual gated fusion mechanism.
+    
+    This layer implements a MetaFusion-inspired approach that goes beyond
+    simple concatenation by enabling metadata-guided interaction with image
+    features through a learned gating mechanism.
+    
+    Design rationale:
+    - Metadata features are projected to image feature dimension
+    - A gating mechanism (tanh) learns which image dimensions should be
+      influenced by metadata
+    - Residual connection preserves original image information while adding
+      metadata-conditioned modulation
+    - More parameter-efficient than attention mechanisms while maintaining
+      interpretability
+    
+    Args:
+        image_dim (int): Dimension of image features (512)
+        meta_dim (int): Dimension of metadata features (128)
+    """
+    
+    def __init__(self, image_dim, meta_dim):
+        super().__init__()
+        
+        # Project metadata to image feature space
+        self.W = nn.Linear(meta_dim, image_dim)
+        
+    def forward(self, image_feat, meta_feat):
+        """Apply metadata-guided gated fusion.
+        
+        Args:
+            image_feat: Image features [batch_size, image_dim]
+            meta_feat: Metadata features [batch_size, meta_dim]
+            
+        Returns:
+            fused_image: Enhanced image features [batch_size, image_dim]
+        """
+        # Project metadata to image feature dimension
+        meta_proj = self.W(meta_feat)  # [batch_size, image_dim]
+        
+        # Metadata-guided gating mechanism (element-wise interaction)
+        # tanh squashes to [-1, 1] providing smooth modulation
+        gate = torch.tanh(image_feat * meta_proj)  # [batch_size, image_dim]
+        
+        # Residual gated fusion: preserve image features + add metadata-guided modulation
+        # This allows the model to learn when and which image dimensions should be
+        # influenced by metadata vs. kept unchanged
+        fused_image = image_feat + image_feat * gate  # [batch_size, image_dim]
+        
+        return fused_image
+
+
 class MffKan(nn.Module): 
     def __init__(self, num_labels, num_features, drop_rate):
         super().__init__()
@@ -102,6 +157,12 @@ class MffKan(nn.Module):
         )
 
         # =========================
+        # Metadata-Guided Fusion Layer
+        # =========================
+        # Implements MetaFusion-inspired gated fusion instead of simple concat
+        self.fusion_layer = FusionLayer(512, 128)
+
+        # =========================
         # Classifier (CNN-based)
         # =========================
         self.fused_dim = 512 + self.de_dim  # 640
@@ -135,19 +196,31 @@ class MffKan(nn.Module):
         if debug:
             print(f"[DEBUG] After IE: {f_i.shape}")
 
-        # Projection
+        # Projection to normalized dimension
         f_i = self.ie_proj(f_i)
 
         if debug:
             print(f"[DEBUG] After ie_proj: {f_i.shape}")
 
-        # Indicator features
+        # Indicator features via KAN-based metadata encoder
         f_p = self.DE(f_p)
 
         if debug:
             print(f"[DEBUG] After DE: {f_p.shape}")
 
-        # Concatenate
+        # ========================================
+        # MetaFusion-style Gated Fusion
+        # ========================================
+        # Replace simple concatenation with metadata-guided residual fusion.
+        # The fusion layer learns to modulate image features based on metadata,
+        # enabling more effective multi-modal interaction than direct concatenation.
+        f_i = self.fusion_layer(f_i, f_p)
+
+        if debug:
+            print(f"[DEBUG] After fusion_layer: {f_i.shape}")
+
+        # Concatenate enhanced image features with metadata features
+        # Final dimension: 512 (image) + 128 (metadata) = 640
         f_f = torch.cat((f_i, f_p), dim=1)
 
         if debug:
